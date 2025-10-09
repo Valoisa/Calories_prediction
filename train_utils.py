@@ -1,5 +1,3 @@
-import re
-
 import timm
 
 import torch
@@ -7,7 +5,7 @@ from torch.utils.data import DataLoader, random_split
 import torch.nn as nn
 import torchmetrics
 
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 
 from transformers import AutoTokenizer
 
@@ -18,23 +16,7 @@ import numpy as np
 from functools import partial
 
 from dataset import MultimodalDataset, collate_fn
-
-        
-def set_requires_grad(module, unfreeze_pattern="", verbose=False):
-    if len(unfreeze_pattern) == 0:
-        for param, _ in module.named_parameters():
-            param.requires_grad = False
-        return
-
-    pattern = re.compile(unfreeze_pattern)
-
-    for name, param in module.named_parameters():
-        if pattern.search(name):
-            param.requires_grad = True
-            if verbose:
-                print(f"Разморожен слой: {name}")
-        else:
-            param.requires_grad = False
+from multimodal_model import MultimodalModel, set_requires_grad
 
 
 def get_train_transforms(cnn_config):
@@ -67,45 +49,9 @@ def get_test_transforms(img_config):
     # и конвертация в тензор
     return A.Compose([
                 A.SmallestMaxSize(max(img_config.input_size[1], img_config.input_size[2]), p=1),
-                A.RandomCrop(height=img_config.input_size[1], width=img_config.input_size[2], p=1),
                 A.Normalize(mean=img_config.mean, std=img_config.std),    
                 A.ToTensorV2()
             ])
-
-class MultimodalModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.text_model = AutoModel.from_pretrained(config.TEXT_MODEL_NAME)
-        self.image_model = timm.create_model(
-            config.IMAGE_MODEL_NAME,
-            pretrained=True,
-            num_classes=0 
-        )
-
-        self.text_proj = nn.Linear(self.text_model.config.hidden_size, config.HIDDEN_DIM)
-        self.image_proj = nn.Linear(self.image_model.num_features, config.HIDDEN_DIM)
-
-        self.regressor = nn.Sequential(
-            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2), 
-            nn.LayerNorm(config.HIDDEN_DIM // 2),       
-            nn.ReLU(),                           
-            nn.Dropout(config.DROPOUT),                    
-            nn.Linear(config.HIDDEN_DIM // 2, 1)
-        )
-
-
-    def forward(self, input_ids, attention_mask, image, mass):
-        text_features = self.text_model(input_ids, attention_mask).last_hidden_state[:,  0, :]
-        image_features = self.image_model(image)
-
-        text_emb = self.text_proj(text_features)
-        image_emb = self.image_proj(image_features)
-
-        fused_emb = text_emb * image_emb
-        
-        output = self.regressor(fused_emb)
-        output = torch.mul(output, mass.view(-1, 1))
-        return output
 
 
 def train(config, device):
@@ -125,8 +71,8 @@ def train(config, device):
         {'params': model.regressor.parameters(), 'lr': config.REGRESSOR_LR}
     ])
 
-    # Для задачи регрессии выберем среднеквадратичную ошибку
-    criterion = nn.MSELoss(reduction='mean')
+    # Для задачи регрессии выберем среднеквадратичную ошибку или среднюю по модулю ошибку
+    criterion = nn.MSELoss(reduction='mean') if config.LOSS == 'MSE' else nn.L1Loss(reduction='mean')
 
     # Для трейна — трансформации с аугментациями, для валидации — без
     cfg = timm.get_pretrained_cfg(config.IMAGE_MODEL_NAME)
@@ -160,13 +106,13 @@ def train(config, device):
     )
     
     # Цикл обучения
-    train_loss = 0.0
     best_mae = np.inf
     # Для валидации выберем MAE
     mae_metrics = torchmetrics.MeanAbsoluteError().to(device)
     for epoch in range(config.EPOCHS):
         model.train()
         mae_metrics.reset()
+        train_loss = 0.
         for batch in train_loader:
             targets = batch['target'].to(device)
             masses = batch['mass'].to(device)
@@ -184,16 +130,15 @@ def train(config, device):
 
         train_loss /= len(train_loader)
         print(f'Epoch {epoch + 1} train loss: {train_loss:.4f}')
-        train_loss = 0.
         val_mae = validate(model, val_loader, device, mae_metrics)
         print(f'Val MAE: {val_mae:.4f}')
 
         if val_mae < best_mae:
-            torch.save(model.state_dict(), config.SAVE_PATH)
+            torch.save(model.state_dict(), f'{config.LOSS}_{config.FUSION}_{config.SAVE_PATH}')
             best_mae = val_mae
 
     # Результаты обучения на тестовой выборке
-    model.load_state_dict(torch.load(config.SAVE_PATH, weights_only=True))
+    model.load_state_dict(torch.load(f'{config.LOSS}_{config.FUSION}_{config.SAVE_PATH}', weights_only=True))
     model.to(device)
     test_dataset = MultimodalDataset(config, split_type='test')
     test_loader = DataLoader(
@@ -229,7 +174,7 @@ def validate(model, val_loader, device, mae_metrics):
 def test_model_inferece(config, device):
     # Загрузим самую удачную модель
     model = MultimodalModel(config)
-    model.load_state_dict(torch.load(config.SAVE_PATH))
+    model.load_state_dict(torch.load(f'{config.LOSS}_{config.FUSION}_{config.SAVE_PATH}'))
     model.to(device)
     model.eval()
 
@@ -270,5 +215,5 @@ def test_model_inferece(config, device):
         abs_errors = np.abs(errors)
         indices = abs_errors.argsort()[::-1]
         hardest_ids = np.array(dish_ids)[indices[:5]]
-        largest_errors = np.array(abs_errors)[indices[:5]]
+        largest_errors = np.array(errors)[indices[:5]]
     return test_mae, hardest_ids, largest_errors
